@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Локальные настройки/дампы
+config.json
+*.dmp
+*.xwd
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
