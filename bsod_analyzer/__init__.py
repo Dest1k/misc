@@ -1,4 +1,4 @@
 # -*- coding: utf-8 -*-
-"""BSOD Dump Analyzer — GUI для поиска и анализа дампов синих экранов Windows."""
+"""BSOD Dump Analyzer."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
