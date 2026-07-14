@@ -1,255 +1,521 @@
 # -*- coding: utf-8 -*-
-"""Рекомендации и безопасный Autofix для устранения причин BSOD.
+"""Targeted remediation plans derived from the local diagnosis.
 
-Философия безопасности:
-  * Ничего не выполняется без явного подтверждения пользователя.
-  * В автоматический прогон попадают только НЕразрушающие проверки
-    (sfc, DISM, chkdsk в режиме сканирования, планирование диагностики ОЗУ,
-    очистка старых дампов).
-  * Потенциально рискованные действия (откат/удаление драйверов, Driver
-    Verifier, chkdsk /f /r) выдаются как рекомендация с пояснением — их
-    пользователь запускает осознанно.
+The planner does not spray SFC/DISM/CHKDSK at every BSOD.  Each automatic
+command is a fixed, reviewed string from an allow-list and has a verification
+step.  Destructive or hard-to-roll-back operations remain explicit manual
+instructions.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Set
 
+from .diagnosis import Diagnosis, diagnose
 from .dump_parser import DumpAnalysis
 
 
 @dataclass
 class FixStep:
-    title: str                 # что делает
-    command: Optional[str]     # команда (None — ручное действие)
-    explanation: str           # зачем
+    # Keep the first fields compatible with the original prototype.
+    title: str
+    command: Optional[str]
+    explanation: str
     needs_admin: bool = True
-    safe_auto: bool = False    # можно ли включать в автоматический прогон
+    safe_auto: bool = False
     needs_reboot: bool = False
+    step_id: str = ""
+    risk: str = "medium"          # read-only / low / medium / high
+    verify_command: Optional[str] = None
+    rationale: str = ""
+    rollback: Optional[str] = None
 
 
-# --- Универсальные безопасные шаги (подходят почти для любого BSOD) ---
+# Commands below are constants rather than strings assembled from dump data.
+# This is both a safety boundary and a defence against command injection from a
+# malicious/corrupt debugger field.
+CMD_SYSTEMINFO = "systeminfo"
+CMD_RECENT_ERRORS = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-WinEvent -FilterHashtable '
+    "@{LogName='System'; Level=1,2; StartTime=(Get-Date).AddDays(-7)} "
+    '| Select-Object -First 80 TimeCreated,Id,ProviderName,Message | Format-List"'
+)
+CMD_DRIVERQUERY = "driverquery /v /fo csv"
+CMD_ENUM_DRIVER_STORE = "pnputil /enum-drivers"
+CMD_GPU_INFO = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance '
+    'Win32_VideoController | Select-Object Name,Status,DriverVersion,PNPDeviceID '
+    '| Format-List"'
+)
+CMD_STORAGE_INFO = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-PhysicalDisk '
+    '| Select-Object FriendlyName,MediaType,HealthStatus,OperationalStatus,Size '
+    '| Format-Table -AutoSize"'
+)
+CMD_STORAGE_EVENTS = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-WinEvent '
+    "-FilterHashtable @{LogName='System'; ProviderName='disk','stornvme','storahci',"
+    "'iaStorAC','Ntfs'; StartTime=(Get-Date).AddDays(-14)} "
+    '| Select-Object -First 100 TimeCreated,Id,ProviderName,Message | Format-List"'
+)
+CMD_CHKDSK_SCAN = "chkdsk C: /scan"
+CMD_MEMORY_INFO = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance '
+    'Win32_PhysicalMemory | Select-Object DeviceLocator,Manufacturer,PartNumber,'
+    'Capacity,Speed,ConfiguredClockSpeed | Format-Table -AutoSize"'
+)
+CMD_WHEA_EVENTS = (
+    'powershell.exe -NoProfile -NonInteractive -Command "Get-WinEvent '
+    "-FilterHashtable @{LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; "
+    'StartTime=(Get-Date).AddDays(-30)} | Select-Object -First 100 '
+    'TimeCreated,Id,LevelDisplayName,Message | Format-List"'
+)
+CMD_DISM_SCAN = "DISM /Online /Cleanup-Image /ScanHealth"
+CMD_DISM_RESTORE = "DISM /Online /Cleanup-Image /RestoreHealth"
+CMD_DISM_CHECK = "DISM /Online /Cleanup-Image /CheckHealth"
+CMD_SFC = "sfc /scannow"
+CMD_SFC_VERIFY = "sfc /verifyonly"
 
-def _base_safe_steps() -> List[FixStep]:
+
+# Exact commands that the Autofix executor may run.  A step must match both ID
+# and command; merely setting safe_auto=True is not sufficient.
+AUTO_COMMAND_ALLOWLIST: Dict[str, str] = {
+    "collect-systeminfo": CMD_SYSTEMINFO,
+    "collect-recent-errors": CMD_RECENT_ERRORS,
+    "collect-driverquery": CMD_DRIVERQUERY,
+    "collect-driver-store": CMD_ENUM_DRIVER_STORE,
+    "collect-gpu-info": CMD_GPU_INFO,
+    "collect-storage-info": CMD_STORAGE_INFO,
+    "collect-storage-events": CMD_STORAGE_EVENTS,
+    "scan-filesystem": CMD_CHKDSK_SCAN,
+    "collect-memory-info": CMD_MEMORY_INFO,
+    "collect-whea-events": CMD_WHEA_EVENTS,
+    "dism-scan": CMD_DISM_SCAN,
+    "dism-restore": CMD_DISM_RESTORE,
+    "sfc-repair": CMD_SFC,
+}
+
+_FORBIDDEN_AUTO_MARKERS = (
+    "verifier",
+    "chkdsk c: /f",
+    "chkdsk c: /r",
+    " /delete-driver",
+    "ddu",
+    "bcdedit",
+    "bootrec",
+    "diskpart",
+    "format ",
+    "flash",
+    "firmware",
+    "bios",
+    "remove-item",
+    "del /",
+    "reg delete",
+    "shutdown",
+    "restart-computer",
+)
+
+
+def _step(
+    step_id: str,
+    title: str,
+    explanation: str,
+    command: Optional[str] = None,
+    *,
+    rationale: str,
+    risk: str = "read-only",
+    admin: bool = False,
+    auto: bool = False,
+    reboot: bool = False,
+    verify: Optional[str] = None,
+    rollback: Optional[str] = None,
+) -> FixStep:
+    return FixStep(
+        title=title,
+        command=command,
+        explanation=explanation,
+        needs_admin=admin,
+        safe_auto=auto,
+        needs_reboot=reboot,
+        step_id=step_id,
+        risk=risk,
+        verify_command=verify,
+        rationale=rationale,
+        rollback=rollback,
+    )
+
+
+def _initial_evidence_steps() -> List[FixStep]:
     return [
-        FixStep(
-            "Проверка целостности системных файлов (SFC)",
-            "sfc /scannow",
-            "Ищет и восстанавливает повреждённые системные файлы Windows. "
-            "Полностью безопасно.",
-            safe_auto=True,
+        _step(
+            "collect-systeminfo",
+            "Снять базовый снимок системы",
+            "Фиксирует версию Windows, модель ПК, BIOS, объём памяти и установленные обновления.",
+            CMD_SYSTEMINFO,
+            rationale="Нужен воспроизводимый контекст до любых изменений.",
+            auto=True,
         ),
-        FixStep(
-            "Восстановление образа системы (DISM)",
-            "DISM /Online /Cleanup-Image /RestoreHealth",
-            "Чинит хранилище компонентов Windows, из которого SFC берёт "
-            "эталонные файлы. Безопасно, требует интернет.",
-            safe_auto=True,
-        ),
-        FixStep(
-            "Проверка диска в режиме сканирования",
-            "chkdsk C: /scan",
-            "Онлайн-проверка файловой системы без блокировки диска и без "
-            "перезагрузки. Безопасно.",
-            safe_auto=True,
-        ),
-        FixStep(
-            "Проверка обновлений Windows",
-            "start ms-settings:windowsupdate",
-            "Свежие обновления часто содержат исправления драйверов и ядра.",
-            needs_admin=False,
-            safe_auto=False,
+        _step(
+            "collect-recent-errors",
+            "Собрать свежие критические события System",
+            "Читает последние ошибки и критические события за семь дней, ничего не меняя.",
+            CMD_RECENT_ERRORS,
+            rationale="События рядом по времени могут подтвердить устройство или подсистему.",
+            auto=True,
         ),
     ]
 
 
-# --- Дополнительные шаги по категории причины ---
+def _driver_steps(d: Diagnosis) -> List[FixStep]:
+    module = d.suspected_module
+    label = module or "предполагаемого драйвера"
+    return [
+        _step(
+            "collect-driverquery",
+            "Снять список загруженных драйверов",
+            "Сохраняет версии, пути и состояние драйверов для сопоставления с дампом.",
+            CMD_DRIVERQUERY,
+            rationale="Категория анализа — драйвер; сначала фиксируем фактические версии.",
+            auto=True,
+        ),
+        _step(
+            "collect-driver-store",
+            "Снять список пакетов Driver Store",
+            "Показывает опубликованные INF, поставщиков, классы и даты пакетов.",
+            CMD_ENUM_DRIVER_STORE,
+            rationale="Позволяет связать .sys с установленным пакетом без удаления драйвера.",
+            auto=True,
+        ),
+        _step(
+            "review-driver-change",
+            "Сопоставить {} с устройством и недавними изменениями".format(label),
+            "Проверьте свойства файла, службу драйвера, INF-пакет и PnP-устройство. "
+            "Сравните дату установки с первым сбоем.",
+            rationale="Обновлять драйвер безопасно только после идентификации устройства и пакета.",
+            risk="read-only",
+        ),
+        _step(
+            "manual-driver-update-or-rollback",
+            "Осознанно обновить или откатить подтверждённый драйвер",
+            "Берите пакет с сайта производителя устройства/ПК. Если сбои начались сразу "
+            "после обновления, предпочтительнее откат к сохранённой версии.",
+            rationale="Действие адресное, но меняет kernel-компонент и требует точки возврата.",
+            risk="medium",
+            admin=True,
+            reboot=True,
+            verify="После перезагрузки проверить новые дампы и повторить целевой сценарий.",
+            rollback="Сохранить текущий INF/установщик и заранее записать способ возврата версии.",
+        ),
+        _step(
+            "driver-verifier-manual-only",
+            "Driver Verifier — только отдельный экспертный сценарий",
+            "Не запускается Autofix. Может намеренно вызвать BSOD и цикл загрузки. Использовать "
+            "только для выбранных сторонних драйверов при наличии инструкции verifier /reset "
+            "из безопасного режима.",
+            command="verifier",
+            rationale="Инструмент полезен, когда обычный дамп не локализует драйвер.",
+            risk="high",
+            admin=True,
+            reboot=True,
+            rollback="verifier /reset из безопасного режима или среды восстановления.",
+        ),
+    ]
+
+
+def _gpu_steps(d: Diagnosis) -> List[FixStep]:
+    return [
+        _step(
+            "collect-gpu-info",
+            "Снять состояние графических адаптеров",
+            "Фиксирует модель, статус, версию драйвера и PnP ID каждого GPU.",
+            CMD_GPU_INFO,
+            rationale="Дамп относится к графическому тракту; нужна точная модель и версия.",
+            auto=True,
+        ),
+        _step(
+            "check-gpu-stability",
+            "Вернуть GPU к штатным частотам и проверить температуры",
+            "Уберите разгон/undervolt, проверьте питание, температуры и повторяемость сбоя "
+            "до переустановки ПО.",
+            rationale="TDR может быть как драйверным, так и аппаратным; этот тест разделяет причины.",
+            risk="low",
+            verify="Повторить нагрузку, при которой возникал сбой, с журналированием температур.",
+            rollback="Записать текущий профиль перед сбросом настроек.",
+        ),
+        _step(
+            "manual-clean-gpu-driver",
+            "Чисто переустановить драйвер GPU только при подтверждении",
+            "Сначала скачать подходящий пакет и подготовить возврат. DDU допустим только как "
+            "ручная процедура в безопасном режиме; Autofix его не запускает.",
+            rationale="Согласованные графические сигналы делают переустановку обоснованной.",
+            risk="high",
+            admin=True,
+            reboot=True,
+            verify="После перезагрузки проверить версию драйвера и повторить проблемный сценарий.",
+            rollback="Иметь предыдущий стабильный установщик и точку восстановления.",
+        ),
+    ] + _driver_steps(d)[:3]
+
+
+def _storage_steps() -> List[FixStep]:
+    return [
+        _step(
+            "collect-storage-info",
+            "Снять состояние физических накопителей",
+            "Читает HealthStatus и OperationalStatus накопителей без изменения дисков.",
+            CMD_STORAGE_INFO,
+            rationale="Категория сбоя связана с хранением данных.",
+            auto=True,
+        ),
+        _step(
+            "collect-storage-events",
+            "Собрать события диска, NVMe/SATA и NTFS",
+            "Ищет ошибки контроллера, сбросы устройства и ошибки файловой системы.",
+            CMD_STORAGE_EVENTS,
+            rationale="События помогают отделить файловую систему от контроллера/железа.",
+            auto=True,
+        ),
+        _step(
+            "scan-filesystem",
+            "Онлайн-проверка файловой системы C:",
+            "Запускает только chkdsk /scan: без блокировки тома, /f и /r.",
+            CMD_CHKDSK_SCAN,
+            rationale="Проверка уместна именно для storage-категории.",
+            risk="low",
+            admin=True,
+            auto=True,
+            verify="chkdsk C: /scan",
+        ),
+        _step(
+            "manual-storage-firmware",
+            "Проверить прошивку и драйвер контроллера вручную",
+            "Сопоставьте модель накопителя, версию прошивки, драйвер AHCI/NVMe/RST и "
+            "рекомендации производителя. Не прошивайте устройство наугад.",
+            rationale="Ошибки storage-стека нередко исправляются производителем, но прошивка рискованна.",
+            risk="high",
+            admin=True,
+            reboot=True,
+            rollback="Перед прошивкой сделать резервную копию и проверить возможность отката.",
+        ),
+    ]
+
 
 def _memory_steps() -> List[FixStep]:
     return [
-        FixStep(
-            "Запланировать диагностику памяти Windows",
-            "mdsched.exe",
-            "Откроет средство проверки ОЗУ. Тест выполнится при следующей "
-            "перезагрузке. Для надёжности лучше MemTest86 (несколько проходов).",
-            needs_admin=False,
+        _step(
+            "collect-memory-info",
+            "Снять конфигурацию модулей памяти",
+            "Фиксирует производитель, part number, объём, номинальную и настроенную частоту.",
+            CMD_MEMORY_INFO,
+            rationale="Повреждение памяти не равно доказанной поломке RAM; нужен контекст конфигурации.",
+            auto=True,
         ),
-        FixStep(
-            "Отключить разгон/XMP памяти (вручную)",
-            None,
-            "Зайдите в BIOS/UEFI и верните память на стандартную частоту "
-            "(отключите XMP/EXPO). Нестабильный XMP — частая причина сбоев ОЗУ.",
-            needs_admin=False,
+        _step(
+            "disable-memory-overclock",
+            "Временно отключить XMP/EXPO и разгон памяти",
+            "Верните JEDEC/Auto, затем проверьте повторяемость. Изменяйте одну переменную за раз.",
+            rationale="Нестабильный профиль часто имитирует дефект RAM или драйвера.",
+            risk="medium",
+            reboot=True,
+            verify="Повторить проблемную нагрузку на штатных настройках.",
+            rollback="Сфотографировать исходные параметры UEFI перед изменением.",
+        ),
+        _step(
+            "manual-memory-test",
+            "Провести последовательный тест ОЗУ",
+            "Сначала Windows Memory Diagnostic как быстрый сигнал, затем несколько проходов "
+            "MemTest86. При ошибках тестировать планки и слоты по одной комбинации.",
+            rationale="Только воспроизводимые ошибки позволяют локализовать модуль, слот или контроллер.",
+            risk="low",
+            reboot=True,
+            verify="Зафиксировать номер теста, адреса ошибок, планку и слот.",
         ),
     ]
-
-
-def _driver_steps(module: Optional[str]) -> List[FixStep]:
-    steps: List[FixStep] = []
-    if module:
-        steps.append(FixStep(
-            f"Обновить/переустановить драйвер: {module}",
-            None,
-            f"Анализ указывает на модуль {module}. Обновите соответствующий "
-            f"драйвер с сайта производителя устройства; если сбой начался "
-            f"после недавнего обновления — откатите драйвер в Диспетчере "
-            f"устройств.",
-            needs_admin=False,
-        ))
-    steps.append(FixStep(
-        "Открыть Диспетчер устройств",
-        "devmgmt.msc",
-        "Проверьте устройства с восклицательным знаком; обновите или откатите "
-        "недавно менявшиеся драйверы.",
-        needs_admin=False,
-    ))
-    steps.append(FixStep(
-        "Driver Verifier — поиск сбойного драйвера (для опытных)",
-        "verifier",
-        "Мощный, но рискованный инструмент: нагружает драйверы и вызывает BSOD "
-        "на виновном. ВАЖНО: включайте проверку только сторонних драйверов и "
-        "умейте отключить (verifier /reset в безопасном режиме). Может привести "
-        "к циклу перезагрузок при неверной настройке.",
-    ))
-    return steps
 
 
 def _hardware_steps() -> List[FixStep]:
     return [
-        FixStep(
-            "Убрать любой разгон CPU/GPU/памяти (вручную)",
-            None,
-            "STOP-коды 0x124/0x9C/0x101 почти всегда про железо. Верните все "
-            "частоты и напряжения на заводские.",
-            needs_admin=False,
+        _step(
+            "collect-whea-events",
+            "Собрать события WHEA-Logger",
+            "Читает аппаратные записи WHEA за 30 дней.",
+            CMD_WHEA_EVENTS,
+            rationale="WHEA_ERROR_RECORD и события часто называют компонент точнее общего STOP 0x124.",
+            auto=True,
         ),
-        FixStep(
-            "Проверить температуры и питание (вручную)",
-            None,
-            "Установите HWiNFO, проверьте температуры CPU/GPU под нагрузкой и "
-            "стабильность напряжений блока питания.",
-            needs_admin=False,
+        _step(
+            "return-stock-settings",
+            "Вернуть CPU/GPU/RAM к заводским настройкам",
+            "Уберите overclock, undervolt, PBO/MCE и нестандартный XMP/EXPO. Затем повторите тест.",
+            rationale="Это наиболее информативный обратимый тест аппаратной стабильности.",
+            risk="medium",
+            reboot=True,
+            verify="Повторить ту же нагрузку и сравнить WHEA/дампы.",
+            rollback="Сохранить профиль UEFI или сфотографировать исходные значения.",
+        ),
+        _step(
+            "inspect-thermals-power",
+            "Проверить температуры, питание и физические соединения",
+            "Логируйте температуры и частоты под нагрузкой; проверьте питание CPU/GPU, "
+            "посадку RAM и кабели. Не меняйте несколько компонентов одновременно.",
+            rationale="Перегрев и просадки питания дают те же общие аппаратные STOP-коды.",
+            risk="medium",
+            verify="Сопоставить момент ошибки с датчиками и WHEA-событиями.",
         ),
     ]
 
 
-def _disk_steps() -> List[FixStep]:
+def _system_corruption_steps() -> List[FixStep]:
+    # Ordering is intentional: repair the component store before SFC consumes it.
     return [
-        FixStep(
-            "Полная проверка и починка диска",
-            "chkdsk C: /f /r",
-            "Исправляет ошибки файловой системы и ищет сбойные сектора. "
-            "ВНИМАНИЕ: выполнится при перезагрузке и может занять часы.",
-            needs_reboot=True,
+        _step(
+            "dism-scan",
+            "Проверить хранилище компонентов DISM",
+            "ScanHealth выполняет диагностику без восстановления.",
+            CMD_DISM_SCAN,
+            rationale="Диагноз указывает на возможное повреждение компонентов Windows.",
+            risk="read-only",
+            admin=True,
+            auto=True,
+            verify=CMD_DISM_CHECK,
         ),
-        FixStep(
-            "Проверить здоровье накопителя (SMART)",
-            None,
-            "Установите CrystalDiskInfo и посмотрите статус SMART — при "
-            "«Тревога/Плохо» диск пора менять.",
-            needs_admin=False,
+        _step(
+            "dism-restore",
+            "Восстановить хранилище компонентов DISM",
+            "RestoreHealth изменяет только повреждённые компоненты Windows и может использовать Windows Update.",
+            CMD_DISM_RESTORE,
+            rationale="Выполняется после ScanHealth и только в категории system_corruption.",
+            risk="low",
+            admin=True,
+            auto=True,
+            verify=CMD_DISM_CHECK,
+        ),
+        _step(
+            "sfc-repair",
+            "Проверить и восстановить системные файлы SFC",
+            "SFC запускается после DISM, чтобы использовать исправное хранилище компонентов.",
+            CMD_SFC,
+            rationale="Последовательность DISM → SFC снижает вероятность повторной ошибки восстановления.",
+            risk="low",
+            admin=True,
+            auto=True,
+            verify=CMD_SFC_VERIFY,
         ),
     ]
 
 
-def _gpu_steps() -> List[FixStep]:
+def _unknown_steps() -> List[FixStep]:
     return [
-        FixStep(
-            "Чистая переустановка драйвера видеокарты",
-            None,
-            "Удалите драйвер GPU утилитой DDU (Display Driver Uninstaller) в "
-            "безопасном режиме, затем поставьте свежий с сайта NVIDIA/AMD/Intel. "
-            "Это лечит большинство ошибок 0x116/0xEA/0x10E.",
-            needs_admin=False,
+        _step(
+            "improve-dump-quality",
+            "Настроить kernel/automatic memory dump и повторить сбор",
+            "Проверьте файл подкачки на системном диске и настройку Startup and Recovery. "
+            "Следующий более полный дамп может содержать отсутствующий стек/объекты.",
+            rationale="Текущих доказательств недостаточно для безопасного ремонта.",
+            risk="medium",
+            admin=True,
+            reboot=True,
+            verify="После следующего сбоя проверить тип и размер нового дампа.",
+            rollback="Записать исходную настройку дампа и файла подкачки.",
+        ),
+        _step(
+            "correlate-changes",
+            "Сопоставить первый сбой с обновлениями и изменениями",
+            "Проверьте историю Windows Update, драйверов, BIOS, нового железа и ПО уровня ядра.",
+            rationale="Временная корреляция часто сужает поиск без рискованных действий.",
+            risk="read-only",
         ),
     ]
-
-
-def _cleanup_step(a: DumpAnalysis) -> FixStep:
-    return FixStep(
-        "Удалить старые дампы после разбора",
-        None,
-        "Когда причина найдена, старые .dmp можно удалить прямо в списке слева, "
-        "чтобы освободить место.",
-        needs_admin=False,
-    )
 
 
 def build_plan(a: DumpAnalysis) -> List[FixStep]:
-    """Собрать план действий под конкретный дамп."""
-    steps: List[FixStep] = list(_base_safe_steps())
-
-    name = a.bugcheck.name if a.bugcheck else ""
-    code = a.bugcheck_code
-
-    added_categories = set()
-
-    def add(category: str, new_steps: List[FixStep]):
-        if category in added_categories:
-            return
-        added_categories.add(category)
-        steps.extend(new_steps)
-
-    # Категоризация по STOP-коду.
-    memory_codes = {0x1A, 0x50, 0xA, 0x12B, 0x109, 0x139}
-    hardware_codes = {0x124, 0x9C, 0x101, 0x7F}
-    disk_codes = {0xF4, 0xEF, 0x7A}
-    gpu_codes = {0x116, 0xEA, 0x10E, 0x113}
-    driver_codes = {0xD1, 0xC2, 0xC4, 0xC5, 0x4A, 0xBE, 0x9F, 0x133, 0x144,
-                    0xCA, 0x19, 0xD5, 0x1E, 0x3B, 0x7E}
-
-    low = (code & 0xFFFFFFFF) if code is not None else None
-
-    if low in memory_codes:
-        add("memory", _memory_steps())
-    if low in hardware_codes:
-        add("hardware", _hardware_steps())
-    if low in disk_codes:
-        add("disk", _disk_steps())
-    if low in gpu_codes:
-        add("gpu", _gpu_steps())
-    if low in driver_codes or a.probable_module:
-        add("driver", _driver_steps(a.probable_module))
-
-    # Если ничего не подошло — добавим общий драйверный блок как самый частый.
-    if not added_categories and code is not None:
-        add("driver", _driver_steps(a.probable_module))
-
-    # Видеодрайвер-специфичный виновник.
-    if a.probable_module and a.probable_module.lower().startswith(
-            ("nvlddmkm", "atikmdag", "amdkmdag", "dxgkrnl", "dxgmms",
-             "igdkmd")):
-        add("gpu", _gpu_steps())
-
-    steps.append(_cleanup_step(a))
-    return steps
+    d = a.diagnosis if isinstance(a.diagnosis, Diagnosis) else diagnose(a)
+    steps = _initial_evidence_steps()
+    if d.category == "driver":
+        steps.extend(_driver_steps(d))
+    elif d.category == "gpu":
+        steps.extend(_gpu_steps(d))
+    elif d.category == "storage":
+        steps.extend(_storage_steps())
+    elif d.category == "memory":
+        steps.extend(_memory_steps())
+    elif d.category == "hardware":
+        steps.extend(_hardware_steps())
+    elif d.category == "system_corruption":
+        steps.extend(_system_corruption_steps())
+    elif d.category == "application":
+        steps.extend([
+            _step(
+                "application-context",
+                "Собрать версию приложения и его собственные журналы",
+                "Проверьте модуль исключения, версию приложения, плагины и события Application.",
+                rationale="User-mode дамп не оправдывает системный ремонт Windows.",
+                risk="read-only",
+            )
+        ])
+    else:
+        steps.extend(_unknown_steps())
+    return _dedupe_steps(steps)
 
 
-def auto_steps(plan: List[FixStep]) -> List[FixStep]:
-    """Только безопасные шаги, которые можно выполнить автоматически."""
-    return [s for s in plan if s.safe_auto and s.command]
+def is_auto_safe_step(step: FixStep) -> bool:
+    if not step.safe_auto or not step.command or not step.step_id:
+        return False
+    if step.risk not in ("read-only", "low"):
+        return False
+    expected = AUTO_COMMAND_ALLOWLIST.get(step.step_id)
+    if expected is None or expected != step.command:
+        return False
+    lowered = step.command.lower()
+    return not any(marker in lowered for marker in _FORBIDDEN_AUTO_MARKERS)
+
+
+def auto_steps(plan: Iterable[FixStep]) -> List[FixStep]:
+    return [step for step in plan if is_auto_safe_step(step)]
 
 
 def format_plan(plan: List[FixStep]) -> str:
-    """Текстовое представление плана для вкладки «Что делать»."""
-    out: List[str] = []
-    out.append("ПЛАН УСТРАНЕНИЯ (по убыванию вероятности/безопасности):")
-    out.append("")
-    for i, s in enumerate(plan, start=1):
-        tags = []
-        if s.safe_auto:
-            tags.append("авто-безопасно")
-        if s.needs_admin:
-            tags.append("нужны права админа")
-        if s.needs_reboot:
+    out: List[str] = [
+        "ПЛАН УСТРАНЕНИЯ — ОТ ДОКАЗАТЕЛЬСТВ К ИЗМЕНЕНИЯМ",
+        "",
+        "Autofix выполняет только фиксированные read-only/low-risk команды. "
+        "Ручная пометка safe_auto в коде не обходит allow-list.",
+        "",
+    ]
+    risk_ru = {
+        "read-only": "только чтение",
+        "low": "низкий",
+        "medium": "средний",
+        "high": "высокий",
+    }
+    for index, step in enumerate(plan, start=1):
+        tags = ["риск: {}".format(risk_ru.get(step.risk, step.risk))]
+        if is_auto_safe_step(step):
+            tags.append("доступно в Autofix")
+        if step.needs_admin:
+            tags.append("нужен администратор")
+        if step.needs_reboot:
             tags.append("нужна перезагрузка")
-        tag_str = f"  [{', '.join(tags)}]" if tags else ""
-        out.append(f"{i}. {s.title}{tag_str}")
-        out.append(f"   {s.explanation}")
-        if s.command:
-            out.append(f"   Команда: {s.command}")
+        out.append("{}. {} [{}]".format(index, step.title, ", ".join(tags)))
+        out.append("   Зачем в этом случае: {}".format(step.rationale))
+        out.append("   Что делать: {}".format(step.explanation))
+        if step.command:
+            out.append("   Команда: {}".format(step.command))
+        if step.verify_command:
+            out.append("   Проверка результата: {}".format(step.verify_command))
+        if step.rollback:
+            out.append("   Возврат/страховка: {}".format(step.rollback))
         out.append("")
-    out.append("Кнопка «Запустить безопасные проверки» выполнит только "
-               "шаги с меткой «авто-безопасно» (SFC, DISM, chkdsk /scan).")
     return "\n".join(out)
+
+
+def _dedupe_steps(steps: Iterable[FixStep]) -> List[FixStep]:
+    result: List[FixStep] = []
+    seen: Set[str] = set()
+    for step in steps:
+        key = step.step_id or step.title
+        if key not in seen:
+            seen.add(key)
+            result.append(step)
+    return result
