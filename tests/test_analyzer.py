@@ -34,8 +34,10 @@ def make_kernel32_dump(bugcheck, params, machine=0x014C):
     struct.pack_into("<I", buf, 0x24, 4)
     struct.pack_into("<I", buf, 0x28, bugcheck)
     struct.pack_into("<4I", buf, 0x2C, *params)
-    # Poison the old, wrong offsets so the regression cannot pass by accident.
-    struct.pack_into("<I", buf, 0x38, 0xDEADC0DE)
+    # Poison 0x3C, where the old (wrong) x64-style reader started params for x86.
+    # Real DUMP_HEADER32 keeps BugCheckParameter4 at 0x38, so poisoning 0x38
+    # would clobber a legitimate field rather than test the regression.
+    struct.pack_into("<I", buf, 0x3C, 0xDEADC0DE)
     return bytes(buf)
 
 

@@ -41,7 +41,7 @@ CMD_RECENT_ERRORS = (
     "@{LogName='System'; Level=1,2; StartTime=(Get-Date).AddDays(-7)} "
     '| Select-Object -First 80 TimeCreated,Id,ProviderName,Message | Format-List"'
 )
-CMD_DRIVERQUERY = "driverquery /v /fo csv"
+CMD_DRIVERQUERY = "driverquery /v"
 CMD_ENUM_DRIVER_STORE = "pnputil /enum-drivers"
 CMD_GPU_INFO = (
     'powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance '

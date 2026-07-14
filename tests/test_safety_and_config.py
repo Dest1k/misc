@@ -142,8 +142,16 @@ class TestAutofixBoundary(unittest.TestCase):
 
     def test_dangerous_operations_are_absent_from_allowlist(self):
         joined = "\n".join(remediation.AUTO_COMMAND_ALLOWLIST.values()).lower()
-        for marker in ("verifier", " /f", " /r", "ddu", "delete-driver", "bcdedit"):
+        # Точные опасные формы, а не расплывчатые подстроки: раньше " /f"/" /r"
+        # ложно совпадали с безопасными "/fo" и "/restorehealth".
+        for marker in (
+            "verifier", "chkdsk c: /f", "chkdsk c: /r", " /delete-driver",
+            "ddu", "bcdedit", "diskpart", "format ", "shutdown",
+        ):
             self.assertNotIn(marker, joined)
+        # Ни один разрушающий флаг chkdsk не должен просочиться в allow-list.
+        import re
+        self.assertIsNone(re.search(r"chkdsk[^\n]*\s/[fr]\b", joined))
 
 
 if __name__ == "__main__":
