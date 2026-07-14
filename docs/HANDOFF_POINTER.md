@@ -1,0 +1,1 @@
+The authoritative handoff is `CLAUDE.md` at the repository root.
