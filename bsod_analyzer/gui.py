@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import autofix as autofix_mod
 from . import config as config_mod
-from . import dump_finder, dump_parser, remediation, report
+from . import correlation, dump_finder, dump_parser, remediation, report
 from .ai_backends import AIRunner
 from .dump_finder import DumpFile
 from .dump_parser import DumpAnalysis
@@ -61,6 +61,10 @@ class BSODAnalyzerApp:
         ttk.Button(
             toolbar, text="🗑 Удалить выбранные", command=self.delete_selected,
         ).pack(side=tk.LEFT, padx=(6, 0))
+        self.correlate_btn = ttk.Button(
+            toolbar, text="🔗 Корреляция серии", command=self.correlate_dumps,
+        )
+        self.correlate_btn.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(
             side=tk.LEFT, fill=tk.Y, padx=10,
         )
@@ -150,6 +154,7 @@ class BSODAnalyzerApp:
         self.report_tab, self.report_text = self._create_text_tab("📄 Отчёт")
         self.tech_tab, self.tech_text = self._create_text_tab("🔧 Технические детали")
         self.plan_tab, self.plan_text = self._create_text_tab("🩺 Что делать")
+        self.corr_tab, self.corr_text = self._create_text_tab("🔗 Корреляция")
         self.ai_tab, self.ai_text = self._create_text_tab(
             "🤖 Ответ ИИ", visible=False,
         )
@@ -341,6 +346,46 @@ class BSODAnalyzerApp:
                 self._task_queue.put(("analysis_error", str(exc)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def correlate_dumps(self) -> None:
+        """Разобрать все найденные дампы и показать корреляцию серии."""
+        if len(self.dumps) < 2:
+            messagebox.showinfo(
+                "Корреляция серии",
+                "Для корреляции нужно хотя бы два дампа. Повторяемость модуля по "
+                "нескольким независимым падениям — более сильный сигнал, чем "
+                "один дамп.")
+            return
+        dumps = list(self.dumps)
+        self._status("Корреляция {} дампов…".format(len(dumps)))
+        self._busy(True)
+        self.correlate_btn.configure(state=tk.DISABLED)
+        use_cdb = bool(self.config.get("use_cdb", True))
+        cdb_path = self.config.get("cdb_path") or None
+        timeout = int(self.config.get("cdb_timeout", 240))
+        timestamps = {d.name: d.mtime_str for d in dumps}
+
+        def work() -> None:
+            analyses = []
+            for d in dumps:
+                try:
+                    analyses.append(dump_parser.analyze(
+                        d.path, use_cdb=use_cdb, cdb_exe=cdb_path,
+                        timeout=timeout))
+                except Exception:  # один битый дамп не должен рушить серию
+                    continue
+            report_obj = correlation.correlate(analyses, timestamps=timestamps)
+            self._task_queue.put(("correlation_done", report_obj))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_correlation_done(self, report_obj) -> None:
+        self._busy(False)
+        self.correlate_btn.configure(state=tk.NORMAL)
+        self._set_text(self.corr_text, correlation.format_report(report_obj))
+        self.nb.select(self.corr_tab)
+        self._status("Корреляция завершена: проанализировано {} дампов.".format(
+            report_obj.total))
 
     def _on_analysis_done(self, analysis: DumpAnalysis) -> None:
         self._busy(False)
@@ -593,6 +638,8 @@ class BSODAnalyzerApp:
                     self._on_analysis_done(payload)  # type: ignore[arg-type]
                 elif kind == "analysis_error":
                     self._on_analysis_error(str(payload))
+                elif kind == "correlation_done":
+                    self._on_correlation_done(payload)
                 elif kind == "ai_done":
                     self._on_ai_done(payload)
         except queue.Empty:
