@@ -9,13 +9,19 @@ dist/
 .venv/
 venv/
 env/
+.pytest_cache/
+.coverage
 
-# Локальные настройки/дампы
+# Local settings, reports and dumps
 config.json
+reports/
 *.dmp
 *.xwd
+*.cab
+*.etl
+Symbols/
 
-# IDE / ОС
+# IDE / OS
 .idea/
 .vscode/
 .DS_Store
