@@ -1,17 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Интеграция с установленными ИИ через их CLI (без API, на подписке).
+"""Optional integrations with locally installed AI CLIs.
 
-Идея: у пользователя уже установлены и авторизованы приложения/CLI
-(Claude Code, Codex CLI, Grok CLI и т.п.). Мы просто запускаем их
-исполняемые файлы как подпроцесс и передаём промпт — работа идёт через
-подписку пользователя, отдельного биллинга по API нет.
-
-Команды запуска настраиваются: они хранятся в конфиге и легко правятся,
-т.к. точный синтаксис у разных версий CLI отличается. В шаблоне команды
-можно использовать плейсхолдер {prompt}. Если {prompt} отсутствует,
-промпт подаётся в stdin.
+AI support is opt-in in :mod:`config` and never participates in the primary
+local diagnosis.  Default templates send the prompt through stdin, keeping the
+full diagnostic text out of the process list.  User templates may still use
+``{prompt}`` for an unusual CLI that cannot read stdin; the settings UI warns
+that this exposes the prompt in process arguments.
 """
-
 from __future__ import annotations
 
 import os
@@ -24,43 +19,38 @@ from typing import Dict, List, Optional
 
 @dataclass
 class AIBackend:
-    key: str                      # внутренний идентификатор
-    label: str                    # что видит пользователь
-    # Имена исполняемых файлов для автоопределения на PATH.
+    key: str
+    label: str
     executables: List[str] = field(default_factory=list)
-    # Шаблон команды. {exe} -> найденный путь, {prompt} -> текст промпта.
-    # Если {prompt} нет в шаблоне — промпт уходит в stdin.
     command_template: str = ""
-    # Доп. каталоги для поиска исполняемого файла (Windows).
     search_dirs: List[str] = field(default_factory=list)
-    # Только копирование промпта в буфер (для GUI-приложений без CLI).
     clipboard_only: bool = False
     notes: str = ""
 
     def resolve_exe(self) -> Optional[str]:
         if self.clipboard_only:
             return None
-        for name in self.executables:
-            found = shutil.which(name)
+        for executable in self.executables:
+            found = shutil.which(executable)
             if found:
                 return found
-        # Ищем в дополнительных каталогах (с учётом .cmd/.exe на Windows).
-        for d in self.search_dirs:
-            expanded = os.path.expandvars(os.path.expanduser(d))
-            for name in self.executables:
-                for ext in ("", ".cmd", ".exe", ".bat"):
-                    cand = os.path.join(expanded, name + ext)
-                    if os.path.isfile(cand):
-                        return cand
+        extensions = ("", ".cmd", ".exe", ".bat") if os.name == "nt" else ("",)
+        for raw_dir in self.search_dirs:
+            directory = os.path.expandvars(os.path.expanduser(raw_dir))
+            for executable in self.executables:
+                for extension in extensions:
+                    candidate = os.path.join(directory, executable + extension)
+                    if os.path.isfile(candidate):
+                        return candidate
         return None
 
     def is_available(self) -> bool:
         return self.clipboard_only or self.resolve_exe() is not None
 
 
-# %APPDATA%\npm — типичное место глобальных npm-CLI на Windows.
 _NPM_DIR = r"%APPDATA%\npm"
-_LOCAL_BIN = r"%LOCALAPPDATA%\Programs"
+_LOCAL_PROGRAMS = r"%LOCALAPPDATA%\Programs"
+_USER_LOCAL_BIN = r"%USERPROFILE%\.local\bin"
 
 
 def default_backends() -> List[AIBackend]:
@@ -69,42 +59,37 @@ def default_backends() -> List[AIBackend]:
             key="claude",
             label="Claude Code (подписка)",
             executables=["claude"],
-            command_template='{exe} -p {prompt}',
-            search_dirs=[_NPM_DIR, r"%USERPROFILE%\.local\bin"],
-            notes="Headless-режим Claude Code: claude -p \"...\". "
-                  "Работает на вашей подписке Claude.",
+            command_template="{exe} -p",
+            search_dirs=[_NPM_DIR, _USER_LOCAL_BIN],
+            notes="Неинтерактивный print-режим; промпт подаётся через stdin.",
         ),
         AIBackend(
             key="codex",
             label="Codex CLI (подписка ChatGPT)",
             executables=["codex"],
-            command_template='{exe} exec {prompt}',
-            search_dirs=[_NPM_DIR, _LOCAL_BIN],
-            notes="Неинтерактивный режим: codex exec \"...\". "
-                  "Использует вход в ChatGPT.",
+            command_template="{exe} exec -",
+            search_dirs=[_NPM_DIR, _LOCAL_PROGRAMS, _USER_LOCAL_BIN],
+            notes="Неинтерактивный exec; '-' означает чтение задания из stdin.",
         ),
         AIBackend(
             key="grok",
-            label="Grok CLI (SuperGrok)",
+            label="Grok CLI (если установлен)",
             executables=["grok"],
-            command_template='{exe} {prompt}',
-            search_dirs=[_NPM_DIR, _LOCAL_BIN],
-            notes="CLI xAI Grok. Точный синтаксис зависит от версии — при "
-                  "необходимости поправьте шаблон команды в настройках.",
+            command_template="{exe}",
+            search_dirs=[_NPM_DIR, _LOCAL_PROGRAMS, _USER_LOCAL_BIN],
+            notes="Синтаксис сторонних Grok CLI различается; шаблон можно исправить в настройках.",
         ),
         AIBackend(
             key="claude_desktop",
             label="Claude Desktop (скопировать промпт)",
             clipboard_only=True,
-            notes="У Claude Desktop нет CLI. Промпт копируется в буфер обмена — "
-                  "вставьте его в окно Claude Desktop.",
+            notes="Исходный дамп не передаётся; в буфер попадает только текстовый отчёт.",
         ),
         AIBackend(
             key="clipboard",
-            label="Просто скопировать промпт в буфер",
+            label="Просто скопировать промпт",
             clipboard_only=True,
-            notes="Скопировать готовый промпт, чтобы вставить в любой чат "
-                  "(Grok Build, ChatGPT, Gemini и т.д.).",
+            notes="Для ручной вставки в любой чат.",
         ),
     ]
 
@@ -115,82 +100,95 @@ class AIResult:
     text: str
     backend: str
     error: Optional[str] = None
+    exit_code: Optional[int] = None
+
+
+def _strip_windows_quotes(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {'"', "'"}:
+        return token[1:-1]
+    return token
+
+
+def _template_argv(template: str, executable: str, prompt: str) -> tuple:
+    """Build argv without invoking a shell; return ``(argv, stdin_text)``."""
+    raw_tokens = shlex.split(template or "{exe}", posix=(os.name != "nt"))
+    if os.name == "nt":
+        raw_tokens = [_strip_windows_quotes(token) for token in raw_tokens]
+    if not raw_tokens:
+        raise ValueError("Пустой шаблон команды ИИ.")
+
+    if not any("{exe}" in token for token in raw_tokens):
+        raise ValueError("Шаблон команды должен содержать {exe}.")
+    prompt_in_argv = any("{prompt}" in token for token in raw_tokens)
+    argv: List[str] = []
+    for token in raw_tokens:
+        token = token.replace("{exe}", executable)
+        if prompt_in_argv:
+            token = token.replace("{prompt}", prompt)
+        argv.append(token)
+    return argv, None if prompt_in_argv else prompt
 
 
 class AIRunner:
-    """Хранит бэкенды и умеет запускать выбранный с заданным промптом."""
-
     def __init__(self, backends: Optional[List[AIBackend]] = None):
-        self.backends: List[AIBackend] = backends or default_backends()
+        self.backends: List[AIBackend] = (
+            list(backends) if backends is not None else default_backends()
+        )
 
     def by_key(self, key: str) -> Optional[AIBackend]:
-        for b in self.backends:
-            if b.key == key:
-                return b
-        return None
+        return next((backend for backend in self.backends if backend.key == key), None)
 
     def available(self) -> List[AIBackend]:
-        return [b for b in self.backends if b.is_available()]
+        return [backend for backend in self.backends if backend.is_available()]
 
     def run(self, key: str, prompt: str, timeout: int = 300) -> AIResult:
         backend = self.by_key(key)
         if backend is None:
-            return AIResult(False, "", key, "Неизвестный бэкенд.")
+            return AIResult(False, "", key, "Неизвестный ИИ-бэкенд.")
         if backend.clipboard_only:
-            return AIResult(False, "", key,
-                            "Это бэкенд только для копирования — "
-                            "используйте кнопку копирования промпта.")
-
-        exe = backend.resolve_exe()
-        if not exe:
-            return AIResult(False, "", key,
-                            f"Исполняемый файл не найден: "
-                            f"{', '.join(backend.executables)}. "
-                            f"Проверьте, что CLI установлен и в PATH.")
-
-        template = backend.command_template or "{exe} {prompt}"
-        use_stdin = "{prompt}" not in template
-
+            return AIResult(False, "", key, "Этот бэкенд предназначен только для копирования промпта.")
+        executable = backend.resolve_exe()
+        if not executable:
+            return AIResult(
+                False, "", key,
+                "Исполняемый файл не найден: {0}.".format(", ".join(backend.executables)),
+            )
         try:
-            if use_stdin:
-                cmd = template.replace("{exe}", _q(exe))
-                argv = shlex.split(cmd, posix=(os.name != "nt"))
-                proc = subprocess.run(
-                    argv, input=prompt, capture_output=True, text=True,
-                    timeout=timeout, errors="replace",
-                )
-            else:
-                cmd = template.replace("{exe}", _q(exe)).replace(
-                    "{prompt}", _q(prompt))
-                argv = shlex.split(cmd, posix=(os.name != "nt"))
-                proc = subprocess.run(
-                    argv, capture_output=True, text=True,
-                    timeout=timeout, errors="replace",
-                )
-        except subprocess.TimeoutExpired:
-            return AIResult(False, "", key,
-                            f"Превышено время ожидания ответа ({timeout} c).")
+            argv, stdin_text = _template_argv(backend.command_template, executable, prompt)
+            environment: Dict[str, str] = dict(os.environ)
+            environment.setdefault("NO_COLOR", "1")
+            process = subprocess.run(
+                argv,
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(timeout)),
+                errors="replace",
+                env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            partial = exc.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", "replace")
+            return AIResult(
+                False, partial.strip(), key,
+                "Превышен таймаут ответа ({0} сек.).".format(timeout),
+            )
         except (OSError, ValueError) as exc:
-            return AIResult(False, "", key, f"Ошибка запуска: {exc}")
+            return AIResult(False, "", key, "Ошибка запуска: {0}".format(exc))
 
-        text = (proc.stdout or "").strip()
-        if proc.returncode != 0 and not text:
-            err = (proc.stderr or "").strip() or f"код возврата {proc.returncode}"
-            return AIResult(False, "", key, err)
-        # Иногда полезный вывод идёт вместе с предупреждениями в stderr.
-        if not text and proc.stderr:
-            text = proc.stderr.strip()
-        return AIResult(True, text, key)
-
-
-def _q(value: str) -> str:
-    """Аккуратно закавычить аргумент для командной строки текущей ОС."""
-    if os.name == "nt":
-        # На Windows shlex.split(posix=False) сохраняет кавычки — обрамляем.
-        if not value:
-            return '""'
-        if any(c in value for c in ' \t"\n'):
-            escaped = value.replace('"', '\\"')
-            return f'"{escaped}"'
-        return value
-    return shlex.quote(value)
+        stdout = (process.stdout or "").strip()
+        stderr = (process.stderr or "").strip()
+        if process.returncode != 0:
+            return AIResult(
+                False,
+                stdout,
+                key,
+                stderr or "ИИ-CLI завершился с кодом {0}.".format(process.returncode),
+                process.returncode,
+            )
+        text = stdout or stderr
+        if not text:
+            return AIResult(False, "", key, "ИИ-CLI завершился без текстового ответа.", process.returncode)
+        return AIResult(True, text, key, None, process.returncode)
